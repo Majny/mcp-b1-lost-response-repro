@@ -50,6 +50,8 @@ What the rows show:
 
 "Expected counterexample" rows assert the unsafe count on purpose, like R04.
 
+Mapping to [ryjen's table in #3394](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/3394#issuecomment-6254309502): S01 ≈ A/B, S02 = D, S03 (committed, then an error) is not in that table; C and E are not covered.
+
 ## Run
 
 From the repository root, with the root requirements:
