@@ -64,6 +64,8 @@ class CleanFixtureTests(unittest.TestCase):
         self.assertEqual(drop["jsonrpc_id"], result["attempts"][0]["jsonrpc_id"])
         self.assertEqual(drop["payload"], {"batch": "batch-1", "notified": 3, "result": "committed"})
         self.assertEqual(result["attempts"][0]["exception"]["code"], fx.REQUEST_TIMEOUT)
+        self.assertEqual(result["attempts"][0]["exception"]["message"], fx.SDK_TIMEOUT)
+        self.assertNotIn(drop["jsonrpc_id"], result["forwarded_reply_ids"])
         self.assertEqual(result["attempts"][1]["payload"],
                          {"batch": "batch-1", "notified": 3, "result": "replayed"})
 
@@ -73,6 +75,10 @@ class CleanFixtureTests(unittest.TestCase):
         a1, a2 = result["attempts"]
         self.assertEqual(a1["arguments"], a2["arguments"])
         self.assertEqual((a1["operation_id"], a2["operation_id"]), ("op-1", "op-2"))
+        # The tool itself received the same arguments and both operation ids.
+        self.assertEqual([r.pop("operation_id") for r in result["server_received"]],
+                         ["op-1", "op-2"])
+        self.assertEqual(result["server_received"], [fx.ARGS, fx.ARGS])
 
     def test_s03_record_first_retry_gets_exact_outcome_unknown(self):
         result = run(case("S03", "operation_id"))
@@ -158,6 +164,21 @@ class BrokenFixtureTests(unittest.TestCase):
                           "attempt 2: unexpected MCPError code -32001",
                           old_oracle_missed=True)
 
+    def test_drop_recorded_but_error_forwarded_fails(self):
+        # The relay logs the drop but forwards an error with the SDK's exact text.
+        for key in ("argument", "operation_id"):
+            with self.subTest(key=key):
+                result = self.assert_fails(
+                    case("S01", key), ("drop_recorded_but_error_forwarded",),
+                    "attempt 1: unexpected MCPError code -32001: Request 'tools/call' timed out",
+                    "attempt 1: status 'unexpected_exception', expected 'timeout'")
+                self.assertIn(result["attempts"][0]["jsonrpc_id"], result["forwarded_reply_ids"])
+
+    def test_non_mcp_exception_fails_the_case(self):
+        self.assert_fails(case("S01", "argument"), ("non_mcp_exception_on_retry",),
+                          "attempt 2: unexpected ValidationError",
+                          "attempt 2: status 'unexpected_exception', expected 'replayed'")
+
     def test_unrelated_mcp_error_without_lost_fault_fails(self):
         self.assert_fails(case("S02", "operation_id"), ("unrelated_mcp_error_on_retry",),
                           "attempt 2: status 'unexpected_exception', expected 'committed'")
@@ -167,6 +188,20 @@ class BrokenFixtureTests(unittest.TestCase):
         self.assert_fails(case("S02", "operation_id"), ("same_operation_id_on_repeat",),
                           "positive control reused an operation id",
                           "attempt 2: dispatches 0, expected 1")
+
+    def test_s02_operation_ids_are_checked_on_the_wire(self):
+        # The wire reuses op-1 while the client's record says op-2, and the
+        # expectations are relaxed to what that produces: only the wire check fails.
+        c = case("S02", "operation_id")
+        relaxed = fx.Case(c.row, c.key, c.store, c.fault, c.operation_ids, c.intended,
+                          (fx.Attempt("committed", 1, 1, "batch-1"),
+                           fx.Attempt("replayed", 0, 0, "batch-1")))
+        result = run(relaxed, "wire_operation_id_differs")
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["problems"], [
+            "sent operation ids ['op-1', 'op-1'], expected ['op-1', 'op-2']",
+            "positive control reused an operation id: ['op-1', 'op-1']",
+        ])
 
     def test_s02_changed_arguments_fail(self):
         self.assert_fails(case("S02", "argument"), ("changed_args_on_repeat",),
@@ -205,6 +240,17 @@ class BrokenFixtureTests(unittest.TestCase):
             for c in (case("S02", "operation_id"), case("S03", "argument", "success-only")):
                 with self.subTest(breaks=breaks, row=c.row, store=c.store):
                     self.assert_fails(c, (breaks,), text, old_oracle_missed=True)
+
+    def test_returned_batch_must_be_the_ledger_batch(self):
+        # Results name batch-N, the ledger rows say nbatch-N.
+        for c, text in (
+            (case("S02", "operation_id"), "attempt 2: batch 'batch-2' is not in the ledger"),
+            (case("S02", "argument"), "attempt 2: batch 'batch-1' is not in the ledger"),
+            (case("S03", "argument", "success-only"),
+             "attempt 2: returned 'batch-2', committed ['nbatch-2']"),
+        ):
+            with self.subTest(row=c.row, key=c.key, store=c.store):
+                self.assert_fails(c, ("ledger_batch_id_differs",), text, old_oracle_missed=True)
 
     def test_ledger_breakage_blocks_the_s01_drop(self):
         self.assert_fails(case("S01", "argument"), ("ledger_missing_row",),

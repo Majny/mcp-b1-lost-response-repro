@@ -64,14 +64,18 @@ Each case fails, with the reason in the Check column, unless all of these hold:
   exactly one dispatch and one complete three-attendee batch, naming that batch. Otherwise
   it refuses and forwards the response.
 - **Timeouts:** a caught `MCPError` counts as a timeout only on S01 attempt 1, with code
-  `REQUEST_TIMEOUT`, after the relay recorded the drop of that attempt's JSON-RPC id. Any
-  other `MCPError` fails the case.
+  `REQUEST_TIMEOUT` and exactly the SDK's message `Request 'tools/call' timed out`, after the
+  relay recorded the drop of that attempt's JSON-RPC id and forwarded no reply for it. Any
+  other exception from `call_tool`, `MCPError` or not, fails the case.
 - **Per attempt:** status, dispatches, effect delta and batch id equal the sequence above.
   A replay must equal the result it replays (on S01, the dropped one). S03 attempt 1 must be
   exactly the injected post-commit error; record-first attempt 2 exactly
   `outcome unknown for this operation; not dispatched again`.
-- **S02 inputs:** both attempts send identical semantic arguments; the operation-id row
-  sends distinct operation ids (`op-1`, `op-2`).
+- **Batch ids:** a returned batch id must be in the ledger; an attempt that committed a
+  batch must return that batch, and a replay must return a batch an earlier attempt committed.
+- **Inputs:** checked on the `tools/call` arguments as sent on the wire, which must equal what
+  the tool received. S02 attempts send identical semantic arguments; operation-id rows send
+  the case's operation ids (S02: distinct, `op-1` then `op-2`).
 - **Ledger:** every committed batch has exactly one notification per invited attendee, each
   carrying the semantic arguments; the batch and dispatch totals match.
 
@@ -79,7 +83,9 @@ Each case fails, with the reason in the Check column, unless all of these hold:
 (`BREAKS` in the fixture: an error before the effect, an unguarded drop, a JSON-RPC error,
 an unrelated or timeout-coded `MCPError` on the retry, a retry that redispatches, a reserved
 record that returns success, a different post-commit error, a missing, duplicate or extra
-ledger row, a reused operation id, changed arguments). Each must fail the check that guards
+ledger row, a ledger batch id the result does not name, a reused operation id, an operation
+id that differs between the wire and the client's record, changed arguments, a recorded drop
+followed by a forwarded timeout error, a malformed result). Each must fail the check that guards
 it; the tests also confirm that several of them passed the earlier oracle (final batch count
 plus fault presence).
 
@@ -102,7 +108,7 @@ nonzero if any case fails.
 ## Archived run
 
 [evidence/2026-11-05/](evidence/2026-11-05/): `scheduling-run.log` (stdout and stderr),
-`scheduling-results.json`, `scheduling-unit-tests.log` (22 tests, OK) and `SHA256.json`.
+`scheduling-results.json`, `scheduling-unit-tests.log` (26 tests, OK) and `SHA256.json`.
 Python 3.12.13, `mcp` 2.2.0, `mcp-types` 2.2.0, negotiated protocolVersion 2025-11-25.
 
 stdout of the fixture, trace lines shortened (stderr also carries the SDK's INFO line
