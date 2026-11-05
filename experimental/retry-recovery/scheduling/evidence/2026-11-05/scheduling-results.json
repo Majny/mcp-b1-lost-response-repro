@@ -3,8 +3,8 @@
   "mcp": "2.2.0",
   "mcp_types": "2.2.0",
   "source_sha256": {
-    "scheduling_fixture.py": "eac84c94ef6cd39c1918012a613c4580a33b2e5d0d0da0ae5d87ed42a9c37d24",
-    "test_scheduling_fixture.py": "b9a4a5f9046f3e46e506cf2e7e016d8f8e2b0ae8caf527256edfa20cecfbe18f"
+    "scheduling_fixture.py": "fbc8f88b91595060688616f88f4c4a2a7ac1e6dd873307c12de3df6b4921b80e",
+    "test_scheduling_fixture.py": "3b56fb1b6119041152df5e35a4a3c040057df6a25930ed1fdb3155355ce6d342"
   },
   "environment": {
     "distributions": [
@@ -57,6 +57,25 @@
         2,
         3
       ],
+      "forwarded_reply_ids": [
+        1,
+        3,
+        4
+      ],
+      "server_received": [
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": null
+        },
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": null
+        }
+      ],
       "transport_faults": [
         {
           "event": "response_dropped_after_commit",
@@ -94,6 +113,9 @@
           },
           "dispatches": 1,
           "effect_delta": 1,
+          "committed_batches": [
+            "batch-1"
+          ],
           "status": "timeout",
           "batch": null,
           "payload": null,
@@ -115,6 +137,7 @@
           },
           "dispatches": 0,
           "effect_delta": 0,
+          "committed_batches": [],
           "status": "replayed",
           "batch": "batch-1",
           "payload": {
@@ -166,6 +189,25 @@
         2,
         3
       ],
+      "forwarded_reply_ids": [
+        1,
+        3,
+        4
+      ],
+      "server_received": [
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": "op-1"
+        },
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": "op-1"
+        }
+      ],
       "transport_faults": [
         {
           "event": "response_dropped_after_commit",
@@ -203,6 +245,9 @@
           },
           "dispatches": 1,
           "effect_delta": 1,
+          "committed_batches": [
+            "batch-1"
+          ],
           "status": "timeout",
           "batch": null,
           "payload": null,
@@ -224,6 +269,7 @@
           },
           "dispatches": 0,
           "effect_delta": 0,
+          "committed_batches": [],
           "status": "replayed",
           "batch": "batch-1",
           "payload": {
@@ -275,6 +321,26 @@
         2,
         4
       ],
+      "forwarded_reply_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "server_received": [
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": null
+        },
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": null
+        }
+      ],
       "transport_faults": [],
       "expected_attempts": [
         {
@@ -302,6 +368,9 @@
           },
           "dispatches": 1,
           "effect_delta": 1,
+          "committed_batches": [
+            "batch-1"
+          ],
           "status": "committed",
           "batch": "batch-1",
           "payload": {
@@ -323,6 +392,7 @@
           },
           "dispatches": 0,
           "effect_delta": 0,
+          "committed_batches": [],
           "status": "replayed",
           "batch": "batch-1",
           "payload": {
@@ -374,6 +444,26 @@
         2,
         4
       ],
+      "forwarded_reply_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "server_received": [
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": "op-1"
+        },
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": "op-2"
+        }
+      ],
       "transport_faults": [],
       "expected_attempts": [
         {
@@ -401,6 +491,9 @@
           },
           "dispatches": 1,
           "effect_delta": 1,
+          "committed_batches": [
+            "batch-1"
+          ],
           "status": "committed",
           "batch": "batch-1",
           "payload": {
@@ -422,6 +515,9 @@
           },
           "dispatches": 1,
           "effect_delta": 1,
+          "committed_batches": [
+            "batch-2"
+          ],
           "status": "committed",
           "batch": "batch-2",
           "payload": {
@@ -494,6 +590,26 @@
         2,
         3
       ],
+      "forwarded_reply_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "server_received": [
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": null
+        },
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": null
+        }
+      ],
       "transport_faults": [],
       "expected_attempts": [
         {
@@ -521,6 +637,9 @@
           },
           "dispatches": 1,
           "effect_delta": 1,
+          "committed_batches": [
+            "batch-1"
+          ],
           "status": "injected_error",
           "batch": null,
           "payload": null,
@@ -538,6 +657,9 @@
           },
           "dispatches": 1,
           "effect_delta": 1,
+          "committed_batches": [
+            "batch-2"
+          ],
           "status": "committed",
           "batch": "batch-2",
           "payload": {
@@ -610,6 +732,26 @@
         2,
         3
       ],
+      "forwarded_reply_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "server_received": [
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": "op-1"
+        },
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": "op-1"
+        }
+      ],
       "transport_faults": [],
       "expected_attempts": [
         {
@@ -637,6 +779,9 @@
           },
           "dispatches": 1,
           "effect_delta": 1,
+          "committed_batches": [
+            "batch-1"
+          ],
           "status": "injected_error",
           "batch": null,
           "payload": null,
@@ -654,6 +799,9 @@
           },
           "dispatches": 1,
           "effect_delta": 1,
+          "committed_batches": [
+            "batch-2"
+          ],
           "status": "committed",
           "batch": "batch-2",
           "payload": {
@@ -725,6 +873,25 @@
       "jsonrpc_ids": [
         2,
         3
+      ],
+      "forwarded_reply_ids": [
+        1,
+        2,
+        3
+      ],
+      "server_received": [
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": null
+        },
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": null
+        }
       ],
       "transport_faults": [],
       "expected_attempts": [
@@ -753,6 +920,9 @@
           },
           "dispatches": 1,
           "effect_delta": 1,
+          "committed_batches": [
+            "batch-1"
+          ],
           "status": "injected_error",
           "batch": null,
           "payload": null,
@@ -770,6 +940,7 @@
           },
           "dispatches": 0,
           "effect_delta": 0,
+          "committed_batches": [],
           "status": "outcome_unknown",
           "batch": null,
           "payload": null,
@@ -817,6 +988,25 @@
         2,
         3
       ],
+      "forwarded_reply_ids": [
+        1,
+        2,
+        3
+      ],
+      "server_received": [
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": "op-1"
+        },
+        {
+          "meeting_id": "meeting-fixture-1",
+          "start": "2026-11-03T10:00",
+          "timezone": "Europe/Prague",
+          "operation_id": "op-1"
+        }
+      ],
       "transport_faults": [],
       "expected_attempts": [
         {
@@ -844,6 +1034,9 @@
           },
           "dispatches": 1,
           "effect_delta": 1,
+          "committed_batches": [
+            "batch-1"
+          ],
           "status": "injected_error",
           "batch": null,
           "payload": null,
@@ -861,6 +1054,7 @@
           },
           "dispatches": 0,
           "effect_delta": 0,
+          "committed_batches": [],
           "status": "outcome_unknown",
           "batch": null,
           "payload": null,
