@@ -16,20 +16,27 @@ and two store policies:
   - record-first: record the operation before the effect, complete it after
 
 Rows marked "expected counterexample" demonstrate unsafe behavior on
-purpose (like R04). The script exits nonzero if any observed effect count
-differs from the expected one, or if an injected fault did not happen.
+purpose (like R04). Every attempt is checked against an expected status,
+dispatch count, effect delta and batch, and the ledger is checked row by
+row. The script exits nonzero if any check fails.
 
 Run:
     pip install -r requirements.txt   # mcp==2.2.0, Python 3.12
-    python experimental/retry-recovery/scheduling/scheduling_fixture.py
+    python experimental/retry-recovery/scheduling/scheduling_fixture.py \
+        [--output results.json]
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import importlib.metadata
 import json
+import platform
+import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -40,18 +47,59 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
 from mcp.shared.memory import SessionMessage, create_client_server_memory_streams
-from mcp_types.jsonrpc import JSONRPCError, JSONRPCRequest, JSONRPCResponse
+from mcp_types.jsonrpc import (
+    INTERNAL_ERROR,
+    REQUEST_TIMEOUT,
+    ErrorData,
+    JSONRPCError,
+    JSONRPCRequest,
+    JSONRPCResponse,
+)
 
 READ_TIMEOUT_SECS = 5.0
 SERVER_SHUTDOWN_GRACE_SECS = 2.0
 PRINCIPAL = "principal-fixture-1"  # stands in for the authenticated caller
 ATTENDEES = ("attendee-1", "attendee-2", "attendee-3")
-PROTOCOL_VERSIONS: set[str] = set()
 ARGS = {
     "meeting_id": "meeting-fixture-1",
     "start": "2026-11-03T10:00",
     "timezone": "Europe/Prague",
 }
+TOOL = "reschedule_meeting"
+INJECTED_ERROR = "injected fault: notifications committed, then an error before the result"
+OUTCOME_UNKNOWN = "outcome unknown for this operation; not dispatched again"
+# MCPServer prefixes a ToolError message with this in the error result.
+TOOL_ERROR_PREFIX = f"Error executing tool {TOOL}: "
+DROPPED = "response_dropped_after_commit"
+
+# Deliberate breakages, used only by test_scheduling_fixture.py to show that
+# each oracle check fails when the behavior it guards is broken. A normal run
+# uses none.
+BREAKS = frozenset({
+    "error_before_effect",  # attempt 1 fails before any effect
+    "drop_any_first_response",  # relay drops the first response without its guards
+    "no_drop",  # relay never drops
+    "jsonrpc_error_first",  # first tools/call response replaced by a JSON-RPC error
+    "unrelated_mcp_error_on_retry",  # second response replaced by an unrelated error
+    "timeout_code_on_retry",  # second response replaced by a timeout-coded error
+    "retry_redispatches",  # dedup lookup skipped after the first call
+    "unknown_returns_success",  # reserved record replays a success
+    "wrong_injected_error",  # post-commit error with a different message
+    "ledger_missing_row",  # one attendee row not written
+    "ledger_duplicate_row",  # one attendee row written twice
+    "ledger_extra_attendee",  # a row for an attendee who is not invited
+    "same_operation_id_on_repeat",  # S02 repeat reuses the first operation id
+    "changed_args_on_repeat",  # S02 repeat changes the semantic arguments
+})
+
+
+@dataclass(frozen=True)
+class Attempt:
+    # "timeout" | "committed" | "replayed" | "injected_error" | "outcome_unknown"
+    status: str
+    dispatches: int  # tool dispatches during this attempt
+    effect_delta: int  # notification batches added to the ledger during this attempt
+    batch: str | None  # batch id the client was given, None if no result
 
 
 @dataclass(frozen=True)
@@ -62,24 +110,34 @@ class Case:
     fault: str  # "lost" | "error" | "none"
     operation_ids: tuple[str, ...]  # per attempt; ignored for the argument key
     intended: int  # notification batches the caller meant to cause
-    expected: int  # batches this configuration is expected to produce
+    attempts: tuple[Attempt, ...]  # expected per-attempt outcome
+
+    @property
+    def expected(self) -> int:
+        return sum(a.effect_delta for a in self.attempts)
 
     @property
     def label(self) -> str:
         return "expected counterexample" if self.expected != self.intended else "safe"
 
 
+LOST_REPLAYED = (Attempt("timeout", 1, 1, None), Attempt("replayed", 0, 0, "batch-1"))
+ERROR_REDISPATCHED = (Attempt("injected_error", 1, 1, None), Attempt("committed", 1, 1, "batch-2"))
+ERROR_UNKNOWN = (Attempt("injected_error", 1, 1, None), Attempt("outcome_unknown", 0, 0, None))
+
 # Fault: "lost" = response dropped after the effect, "error" = effect committed,
 # then an error before the result, "none" = no fault (deliberate repeat).
 CASES = [
-    Case("S01", "argument", "record-first", "lost", ("op-1", "op-1"), 1, 1),
-    Case("S01", "operation_id", "record-first", "lost", ("op-1", "op-1"), 1, 1),
-    Case("S02", "argument", "record-first", "none", ("op-1", "op-2"), 2, 1),
-    Case("S02", "operation_id", "record-first", "none", ("op-1", "op-2"), 2, 2),
-    Case("S03", "argument", "success-only", "error", ("op-1", "op-1"), 1, 2),
-    Case("S03", "operation_id", "success-only", "error", ("op-1", "op-1"), 1, 2),
-    Case("S03", "argument", "record-first", "error", ("op-1", "op-1"), 1, 1),
-    Case("S03", "operation_id", "record-first", "error", ("op-1", "op-1"), 1, 1),
+    Case("S01", "argument", "record-first", "lost", ("op-1", "op-1"), 1, LOST_REPLAYED),
+    Case("S01", "operation_id", "record-first", "lost", ("op-1", "op-1"), 1, LOST_REPLAYED),
+    Case("S02", "argument", "record-first", "none", ("op-1", "op-2"), 2,
+         (Attempt("committed", 1, 1, "batch-1"), Attempt("replayed", 0, 0, "batch-1"))),
+    Case("S02", "operation_id", "record-first", "none", ("op-1", "op-2"), 2,
+         (Attempt("committed", 1, 1, "batch-1"), Attempt("committed", 1, 1, "batch-2"))),
+    Case("S03", "argument", "success-only", "error", ("op-1", "op-1"), 1, ERROR_REDISPATCHED),
+    Case("S03", "operation_id", "success-only", "error", ("op-1", "op-1"), 1, ERROR_REDISPATCHED),
+    Case("S03", "argument", "record-first", "error", ("op-1", "op-1"), 1, ERROR_UNKNOWN),
+    Case("S03", "operation_id", "record-first", "error", ("op-1", "op-1"), 1, ERROR_UNKNOWN),
 ]
 
 
@@ -90,47 +148,81 @@ class ServerState:
     # Dedup store: in-process only, not durable.
     dedup: dict[str, dict[str, Any]] = field(default_factory=dict)
     dispatches: int = 0
+    calls: int = 0
 
-    def batches(self) -> int:
-        return len({row["batch"] for row in self.ledger})
+    def batches(self) -> list[str]:
+        """Batch ids in the ledger, in commit order."""
+        return list(dict.fromkeys(row["batch"] for row in self.ledger))
+
+
+def ledger_problems(ledger: list[dict[str, Any]], args: dict[str, Any] = ARGS) -> list[str]:
+    """Every committed batch must hold exactly one row per expected attendee,
+    each carrying the semantic arguments; anything else is reported."""
+    problems = []
+    batches: dict[str, list[dict[str, Any]]] = {}
+    for row in ledger:
+        batches.setdefault(row["batch"], []).append(row)
+    for batch, rows in batches.items():
+        attendees = sorted(row["attendee"] for row in rows)
+        if attendees != sorted(ATTENDEES):
+            problems.append(f"ledger {batch}: attendees {attendees}, "
+                            f"expected one each of {list(ATTENDEES)}")
+        for row in rows:
+            semantic = {k: row.get(k) for k in args}
+            if semantic != args:
+                problems.append(f"ledger {batch}: row {row['attendee']} carries {semantic}")
+    return problems
 
 
 def dedup_key(case: Case, args: dict[str, Any], operation_id: str | None) -> str:
     if case.key == "operation_id":
         if not operation_id:
             raise ToolError("operation_id is required in this configuration")
-        return f"{PRINCIPAL}/reschedule_meeting/op:{operation_id}"
-    digest = hashlib.sha256(
-        json.dumps([PRINCIPAL, "reschedule_meeting", args], sort_keys=True).encode()
-    )
-    return f"{PRINCIPAL}/reschedule_meeting/args:{digest.hexdigest()[:12]}"
+        return f"{PRINCIPAL}/{TOOL}/op:{operation_id}"
+    digest = hashlib.sha256(json.dumps([PRINCIPAL, TOOL, args], sort_keys=True).encode())
+    return f"{PRINCIPAL}/{TOOL}/args:{digest.hexdigest()[:12]}"
 
 
-def build_server(case: Case, state: ServerState) -> MCPServer:
+def build_server(case: Case, state: ServerState, breaks: frozenset[str] = frozenset()) -> MCPServer:
     srv = MCPServer(name="scheduling-fixture")
 
     @srv.tool()
     def reschedule_meeting(
         meeting_id: str, start: str, timezone: str, operation_id: str | None = None
     ) -> str:
+        state.calls += 1
+        if "error_before_effect" in breaks and state.calls == 1:
+            raise ToolError("broken fixture: failed before any effect")
         args = {"meeting_id": meeting_id, "start": start, "timezone": timezone}
         key = dedup_key(case, args, operation_id)
         entry = state.dedup.get(key)
+        if "retry_redispatches" in breaks and state.calls > 1:
+            entry = None
         if entry is not None:
             if entry["state"] == "completed":
                 return json.dumps({**entry["result"], "result": "replayed"})
+            if "unknown_returns_success" in breaks:
+                return json.dumps({"batch": "batch-1", "notified": len(ATTENDEES),
+                                   "result": "replayed"})
             # Recorded but never completed: the effect may or may not have happened.
-            raise ToolError("outcome unknown for this operation; not dispatched again")
+            raise ToolError(OUTCOME_UNKNOWN)
         if case.store == "record-first":
             state.dedup[key] = {"state": "reserved"}
         state.dispatches += 1
         batch = f"batch-{state.dispatches}"
-        for attendee in ATTENDEES:
+        attendees = list(ATTENDEES)
+        if "ledger_missing_row" in breaks:
+            attendees = attendees[:-1]
+        if "ledger_duplicate_row" in breaks:
+            attendees.append(attendees[0])
+        if "ledger_extra_attendee" in breaks:
+            attendees.append("attendee-uninvited")
+        for attendee in attendees:
             state.ledger.append({"batch": batch, "attendee": attendee, **args})
         if case.fault == "error" and state.dispatches == 1:
-            raise ToolError(
-                "injected fault: notifications committed, then an error before the result"
-            )
+            if "wrong_injected_error" in breaks:
+                raise ToolError("provider rejected the request")
+            raise ToolError(INJECTED_ERROR)
         result = {"batch": batch, "notified": len(ATTENDEES)}
         state.dedup[key] = {"state": "completed", "result": result}
         return json.dumps({**result, "result": "committed"})
@@ -138,14 +230,50 @@ def build_server(case: Case, state: ServerState) -> MCPServer:
     return srv
 
 
-def client_view(res: Any) -> str:
-    text = next((b.text for b in res.content if b.type == "text"), "")
-    return f"error: {text}" if res.is_error else f"ok: {text}"
+def wire_result(rpc: JSONRPCResponse) -> tuple[bool, dict[str, Any] | None]:
+    """(isError, parsed JSON text) of a tools/call result as sent on the wire."""
+    result = rpc.result if isinstance(rpc.result, dict) else {}
+    texts = [b.get("text") for b in result.get("content", []) if b.get("type") == "text"]
+    try:
+        payload = json.loads(texts[0]) if len(texts) == 1 else None
+    except ValueError:
+        payload = None
+    return bool(result.get("isError")), payload if isinstance(payload, dict) else None
 
 
-async def run_case(case: Case) -> tuple[int, list[str]]:
+def classify(res: Any) -> tuple[str, dict[str, Any] | None, str]:
+    """Client-visible status, parsed payload and raw text of a CallToolResult."""
+    texts = [b.text for b in res.content if b.type == "text"]
+    text = texts[0] if len(texts) == 1 else ""
+    if res.is_error:
+        if text == TOOL_ERROR_PREFIX + INJECTED_ERROR:
+            return "injected_error", None, text
+        if text == TOOL_ERROR_PREFIX + OUTCOME_UNKNOWN:
+            return "outcome_unknown", None, text
+        return "unexpected_error", None, text
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return "unexpected_result", None, text
+    if (
+        isinstance(payload, dict)
+        and payload.get("result") in ("committed", "replayed")
+        and payload.get("notified") == len(ATTENDEES)
+    ):
+        return payload["result"], payload, text
+    return "unexpected_result", payload if isinstance(payload, dict) else None, text
+
+
+async def run_case(
+    case: Case,
+    breaks: frozenset[str] = frozenset(),
+    read_timeout: float = READ_TIMEOUT_SECS,
+) -> dict[str, Any]:
+    unknown = set(breaks) - BREAKS
+    if unknown:
+        raise ValueError(f"unknown breaks {sorted(unknown)}")
     state = ServerState()
-    server = build_server(case, state)
+    server = build_server(case, state, breaks)
     problems: list[str] = []
     streams_cm = create_client_server_memory_streams()
     client_streams, server_streams = await streams_cm.__aenter__()
@@ -154,7 +282,7 @@ async def run_case(case: Case) -> tuple[int, list[str]]:
     c2r_send, c2r_recv = anyio.create_memory_object_stream(256)
     r2c_send, r2c_recv = anyio.create_memory_object_stream(256)
     tools_call_ids: list[Any] = []
-    dropped: list[Any] = []
+    faults: list[dict[str, Any]] = []
     server_done = anyio.Event()
 
     async def relay_c2s() -> None:
@@ -167,21 +295,60 @@ async def run_case(case: Case) -> tuple[int, list[str]]:
                         tools_call_ids.append(msg.message.id)
                 await c_write.send(msg)
 
+    def replace_with_error(msg: SessionMessage, code: int, message: str) -> SessionMessage:
+        faults.append({"event": "response_replaced", "jsonrpc_id": msg.message.id,
+                       "code": code, "message": message})
+        return SessionMessage(JSONRPCError(
+            jsonrpc="2.0", id=msg.message.id, error=ErrorData(code=code, message=message)))
+
+    def drop_refusal(rpc: Any) -> str | None:
+        """Why the first response must not be dropped, or None if it may be.
+
+        Only a successful tools/call result for an effect that is already
+        committed may be dropped: one dispatch, one complete batch, and the
+        result names that batch.
+        """
+        if not isinstance(rpc, JSONRPCResponse):
+            return f"first response is a {type(rpc).__name__}, not a JSONRPCResponse"
+        is_error, payload = wire_result(rpc)
+        if is_error:
+            return "first response is a tool error result, not a success"
+        if state.dispatches != 1 or len(state.batches()) != 1:
+            return f"{state.dispatches} dispatches, batches {state.batches()} before the drop"
+        if ledger_problems(state.ledger):
+            return "ledger is not one complete batch before the drop"
+        if not payload or payload.get("batch") != state.batches()[0]:
+            return f"result {payload!r} does not name the committed batch"
+        return None
+
     async def relay_s2c() -> None:
         # Same fault hook as the root scripts: the attempt-1 response only
         # exists once the handler returned, so the drop is after the effect.
         async with c_read, r2c_send:
             async for msg in c_read:
+                rpc = msg.message if isinstance(msg, SessionMessage) else None
+                reply = isinstance(rpc, (JSONRPCResponse, JSONRPCError))
+                first = reply and bool(tools_call_ids) and rpc.id == tools_call_ids[0]
+                second = reply and len(tools_call_ids) > 1 and rpc.id == tools_call_ids[1]
+                if first and "jsonrpc_error_first" in breaks:
+                    msg = replace_with_error(msg, INTERNAL_ERROR, "broken fixture: error response")
+                    rpc = msg.message
+                if second and "unrelated_mcp_error_on_retry" in breaks:
+                    msg = replace_with_error(msg, INTERNAL_ERROR, "broken fixture: unrelated failure")
+                if second and "timeout_code_on_retry" in breaks:
+                    msg = replace_with_error(msg, REQUEST_TIMEOUT, "Request 'tools/call' timed out")
                 if (
-                    case.fault == "lost"
-                    and not dropped
-                    and isinstance(msg, SessionMessage)
-                    and isinstance(msg.message, (JSONRPCResponse, JSONRPCError))
-                    and tools_call_ids
-                    and msg.message.id == tools_call_ids[0]
+                    first
+                    and case.fault == "lost"
+                    and "no_drop" not in breaks
+                    and not any(f["event"] == DROPPED for f in faults)
                 ):
-                    dropped.append(msg.message.id)
-                    continue
+                    refusal = None if "drop_any_first_response" in breaks else drop_refusal(rpc)
+                    if refusal is None:
+                        payload = wire_result(rpc)[1] if isinstance(rpc, JSONRPCResponse) else None
+                        faults.append({"event": DROPPED, "jsonrpc_id": rpc.id, "payload": payload})
+                        continue
+                    problems.append(f"drop refused: {refusal}")
                 await r2c_send.send(msg)
 
     async def run_server() -> None:
@@ -196,6 +363,7 @@ async def run_case(case: Case) -> tuple[int, list[str]]:
         finally:
             server_done.set()
 
+    attempts: list[dict[str, Any]] = []
     async with anyio.create_task_group() as tg:
         tg.start_soon(run_server)
         tg.start_soon(relay_c2s)
@@ -203,36 +371,53 @@ async def run_case(case: Case) -> tuple[int, list[str]]:
         session = ClientSession(r2c_recv, c2r_send)
         await session.__aenter__()
         init = await session.initialize()
-        PROTOCOL_VERSIONS.add(init.protocol_version)
 
         for attempt, operation_id in enumerate(case.operation_ids, start=1):
             args = dict(ARGS)
+            if attempt == 2 and "changed_args_on_repeat" in breaks:
+                args["start"] = "2026-11-03T11:00"
+            if attempt == 2 and "same_operation_id_on_repeat" in breaks:
+                operation_id = case.operation_ids[0]
             if case.key == "operation_id":
                 args["operation_id"] = operation_id
-            before_dispatches, before_batches = state.dispatches, state.batches()
+            before_dispatches, before_batches = state.dispatches, len(state.batches())
+            calls_before = len(tools_call_ids)
+            payload, text, exception = None, None, None
             try:
-                res = await session.call_tool(
-                    "reschedule_meeting", args, read_timeout_seconds=READ_TIMEOUT_SECS
-                )
-                seen = client_view(res)
+                res = await session.call_tool(TOOL, args, read_timeout_seconds=read_timeout)
             except MCPError as exc:
-                seen = f"timeout ({type(exc).__name__})"
-            trace = {
-                "row": case.row,
-                "key": case.key,
-                "store": case.store,
+                exception = {"type": type(exc).__name__, "code": exc.code, "message": exc.message}
+                jsonrpc_id = tools_call_ids[-1] if len(tools_call_ids) > calls_before else None
+                dropped = [f for f in faults if f["event"] == DROPPED]
+                # Only the deliberately dropped attempt-1 response counts as a timeout.
+                if (
+                    case.fault == "lost"
+                    and attempt == 1
+                    and exc.code == REQUEST_TIMEOUT
+                    and "timed out" in exc.message
+                    and len(dropped) == 1
+                    and dropped[0]["jsonrpc_id"] == jsonrpc_id
+                ):
+                    status = "timeout"
+                else:
+                    status = "unexpected_exception"
+                    problems.append(f"attempt {attempt}: unexpected {type(exc).__name__} "
+                                    f"code {exc.code}: {exc.message}")
+            else:
+                status, payload, text = classify(res)
+            attempts.append({
                 "attempt": attempt,
-                "jsonrpc_id": tools_call_ids[-1],
+                "jsonrpc_id": tools_call_ids[-1] if len(tools_call_ids) > calls_before else None,
                 "operation_id": operation_id if case.key == "operation_id" else None,
+                "arguments": {k: args[k] for k in ARGS},
                 "dispatches": state.dispatches - before_dispatches,
-                "effect_delta": state.batches() - before_batches,
-                "client": seen,
-            }
-            print("trace " + json.dumps(trace))
-            if attempt == 1 and case.fault == "lost" and not seen.startswith("timeout"):
-                problems.append("attempt 1 did not time out")
-            if attempt == 1 and case.fault == "error" and not seen.startswith("error"):
-                problems.append("attempt 1 did not return the injected error")
+                "effect_delta": len(state.batches()) - before_batches,
+                "status": status,
+                "batch": payload.get("batch") if payload else None,
+                "payload": payload,
+                "client_text": text,
+                "exception": exception,
+            })
 
         await session.__aexit__(None, None, None)
         await c2r_send.aclose()
@@ -241,38 +426,150 @@ async def run_case(case: Case) -> tuple[int, list[str]]:
         tg.cancel_scope.cancel()
 
     await streams_cm.__aexit__(None, None, None)
-    if case.fault == "lost" and not dropped:
-        problems.append("attempt-1 response was not dropped")
-    attempts = len(case.operation_ids)
-    if len(tools_call_ids) != attempts or len(set(tools_call_ids)) != attempts:
+    problems += oracle_problems(case, attempts, faults, tools_call_ids, state)
+    return {
+        "row": case.row, "key": case.key, "store": case.store, "fault": case.fault,
+        "label": case.label, "intended": case.intended, "expected": case.expected,
+        "observed": len(state.batches()), "passed": not problems, "problems": problems,
+        "protocol_version": init.protocol_version, "jsonrpc_ids": tools_call_ids,
+        "transport_faults": faults, "expected_attempts": [asdict(a) for a in case.attempts],
+        "attempts": attempts, "ledger": state.ledger,
+    }
+
+
+def oracle_problems(
+    case: Case,
+    attempts: list[dict[str, Any]],
+    faults: list[dict[str, Any]],
+    tools_call_ids: list[Any],
+    state: ServerState,
+) -> list[str]:
+    problems = []
+    n = len(case.attempts)
+    if len(tools_call_ids) != n or len(set(tools_call_ids)) != n:
         problems.append(f"unexpected tools/call ids {tools_call_ids!r}")
-    return state.batches(), problems
+    if len(attempts) != n:
+        return problems + [f"{len(attempts)} attempts, expected {n}"]
+
+    # Per attempt: status, dispatches, effect delta and batch.
+    for seen, want in zip(attempts, case.attempts):
+        for name in ("status", "dispatches", "effect_delta", "batch"):
+            if seen[name] != getattr(want, name):
+                problems.append(f"attempt {seen['attempt']}: {name} {seen[name]!r}, "
+                                f"expected {getattr(want, name)!r}")
+
+    # Lost response: exactly one drop, of attempt 1's response, and a replay
+    # returns exactly the dropped result.
+    dropped = [f for f in faults if f["event"] == DROPPED]
+    if case.fault == "lost":
+        if len(dropped) != 1 or dropped[0]["jsonrpc_id"] != attempts[0]["jsonrpc_id"]:
+            problems.append(f"expected one drop of attempt 1's response, got {dropped!r}")
+        elif attempts[1]["status"] == "replayed":
+            original = dict(dropped[0]["payload"] or {}, result="replayed")
+            if attempts[1]["payload"] != original:
+                problems.append(f"attempt 2 replayed {attempts[1]['payload']!r}, "
+                                f"not the dropped result {dropped[0]['payload']!r}")
+    elif dropped:
+        problems.append(f"unexpected drop {dropped!r}")
+
+    # Without a lost response, a replay equals attempt 1's delivered result.
+    if case.fault != "lost":
+        for seen in attempts[1:]:
+            if seen["status"] == "replayed":
+                original = dict(attempts[0]["payload"] or {}, result="replayed")
+                if seen["payload"] != original:
+                    problems.append(f"attempt {seen['attempt']} replayed {seen['payload']!r}, "
+                                    f"not attempt 1's {attempts[0]['payload']!r}")
+
+    # Deliberate repeat: identical semantic arguments; the positive control
+    # sends distinct caller operation ids.
+    if case.fault == "none":
+        if len({json.dumps(a["arguments"], sort_keys=True) for a in attempts}) != 1:
+            problems.append("repeat changed the semantic arguments: "
+                            f"{[a['arguments'] for a in attempts]}")
+        if case.key == "operation_id":
+            ops = [a["operation_id"] for a in attempts]
+            if len(set(ops)) != len(ops):
+                problems.append(f"positive control reused an operation id: {ops}")
+
+    # Effect oracle: total batches and dispatches, and every row of every batch.
+    if len(state.batches()) != case.expected:
+        problems.append(f"ledger has {len(state.batches())} batches, expected {case.expected}")
+    if state.dispatches != sum(a.dispatches for a in case.attempts):
+        problems.append(f"{state.dispatches} dispatches in total")
+    problems += ledger_problems(state.ledger)
+    return problems
 
 
-async def main() -> int:
-    rows = []
+def fmt(values: list[Any]) -> str:
+    return ",".join("-" if v is None else str(v) for v in values)
+
+
+def table(results: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "| Row | Key | Store | Intended | Expected | Observed | Dispatches | Effect deltas "
+        "| Statuses | Batches | Label | Check |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for r in results:
+        att = r["attempts"]
+        check = "pass" if r["passed"] else "FAIL " + "; ".join(r["problems"])
+        lines.append(
+            f"| {r['row']} | {r['key']} | {r['store']} | {r['intended']} | {r['expected']} "
+            f"| {r['observed']} | {fmt([a['dispatches'] for a in att])} "
+            f"| {fmt([a['effect_delta'] for a in att])} | {fmt([a['status'] for a in att])} "
+            f"| {fmt([a['batch'] for a in att])} | {r['label']} | {check} |"
+        )
+    return lines
+
+
+async def run_all() -> list[dict[str, Any]]:
+    results = []
     for case in CASES:
-        observed, problems = await run_case(case)
-        ok = observed == case.expected and not problems
-        rows.append((case, observed, ok, problems))
+        result = await run_case(case)
+        for a in result["attempts"]:
+            trace = {k: a[k] for k in ("attempt", "jsonrpc_id", "operation_id", "dispatches",
+                                       "effect_delta", "status", "batch")}
+            print("trace " + json.dumps({"row": case.row, "key": case.key,
+                                         "store": case.store, **trace}))
+        results.append(result)
+    return results
 
-    print(f"negotiated protocolVersion: {', '.join(sorted(PROTOCOL_VERSIONS))}")
-    print("| Row | Key | Store | Intended | Expected | Observed | Label | Check |")
-    print("| --- | --- | --- | --- | --- | --- | --- | --- |")
-    for case, observed, ok, problems in rows:
-        check = (
-            "pass"
-            if ok
-            else "FAIL " + "; ".join(problems or [f"expected {case.expected}"])
-        )
-        print(
-            f"| {case.row} | {case.key} | {case.store} | {case.intended} | {case.expected} "
-            f"| {observed} | {case.label} | {check} |"
-        )
-    failed = [r for r in rows if not r[2]]
-    print(f"{len(rows) - len(failed)}/{len(rows)} cases match expectations")
-    return 1 if failed else 0
+
+def environment_freeze() -> dict[str, Any]:
+    proc = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True,
+                          text=True, timeout=120, check=True)
+    lines = sorted(line for line in proc.stdout.splitlines() if line.strip())
+    return {"pip_freeze": lines,
+            "pip_freeze_sha256": hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", type=Path, help="write structured results as JSON")
+    args = parser.parse_args()
+    results = anyio.run(run_all)
+    versions = sorted({r["protocol_version"] for r in results})
+    print(f"negotiated protocolVersion: {', '.join(versions)}")
+    print("\n".join(table(results)))
+    passed = sum(r["passed"] for r in results)
+    print(f"{passed}/{len(results)} cases match expectations")
+    if args.output:
+        here = Path(__file__).resolve()
+        report = {
+            "python": platform.python_version(),
+            "mcp": importlib.metadata.version("mcp"),
+            "mcp_types": importlib.metadata.version("mcp-types"),
+            "source_sha256": {here.name: hashlib.sha256(here.read_bytes()).hexdigest()},
+            "environment": environment_freeze(),
+            "read_timeout_s": READ_TIMEOUT_SECS,
+            "results": results, "passed": passed, "total": len(results),
+            "scope": "real MCP memory streams; synthetic in-process ledger and dedup store",
+        }
+        args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8",
+                               newline="\n")
+    return 0 if passed == len(results) else 1
 
 
 if __name__ == "__main__":
-    sys.exit(anyio.run(main))
+    sys.exit(main())
