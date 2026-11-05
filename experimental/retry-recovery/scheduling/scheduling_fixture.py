@@ -33,7 +33,6 @@ import hashlib
 import importlib.metadata
 import json
 import platform
-import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -537,11 +536,11 @@ async def run_all() -> list[dict[str, Any]]:
 
 
 def environment_freeze() -> dict[str, Any]:
-    proc = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True,
-                          text=True, timeout=120, check=True)
-    lines = sorted(line for line in proc.stdout.splitlines() if line.strip())
-    return {"pip_freeze": lines,
-            "pip_freeze_sha256": hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()}
+    """Installed distributions as name==version (the venv may have no pip)."""
+    lines = sorted({f"{d.metadata['Name']}=={d.version}"
+                    for d in importlib.metadata.distributions()}, key=str.lower)
+    return {"distributions": lines,
+            "distributions_sha256": hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()}
 
 
 def main() -> int:
@@ -560,7 +559,8 @@ def main() -> int:
             "python": platform.python_version(),
             "mcp": importlib.metadata.version("mcp"),
             "mcp_types": importlib.metadata.version("mcp-types"),
-            "source_sha256": {here.name: hashlib.sha256(here.read_bytes()).hexdigest()},
+            "source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in
+                              (here, here.with_name("test_scheduling_fixture.py"))},
             "environment": environment_freeze(),
             "read_timeout_s": READ_TIMEOUT_SECS,
             "results": results, "passed": passed, "total": len(results),
